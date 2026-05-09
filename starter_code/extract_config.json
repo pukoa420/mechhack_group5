@@ -1,0 +1,22 @@
+{
+  "_comment": "Residual-extraction config. CLI args (--model_path, --layers, ...) override these. Env vars (UPPERCASE versions, e.g. LAYERS=10,30,50, MODEL_PATH=...) override the file but are themselves overridden by CLI.",
+
+  "model_key": "gemma4_31b",
+  "_model_key_help": "gemma4_31b or qwen36 — used for default samples_file path and HF-repo fallback if model_path is not local.",
+
+  "_model_path_help": "Local path to the HF model snapshot. Leave null to auto-resolve to ./models/<repo-name> or HF cache. Run `python download_models.py` to fetch the weights.",
+  "model_path": null,
+
+  "use_chat_template": true,
+
+  "_layers_help": "Layer-spec syntax: 'middle' | 'early' | 'late' | int | 'i,j,k' | 'start:stop:step' | 'all'. Indexes into hidden_states (0 = embeddings, 1..n_layers = transformer block outputs).",
+  "layers": "middle",
+
+  "_dtype_help": "Storage dtype on disk: 'fp16' (~2 bytes/value) or 'bf16'. fp16 halves disk vs fp32 with negligible probe-AUC impact.",
+  "dtype": "fp16",
+
+  "samples_file": null,
+  "_samples_file_help": "Override the auto-default samples_file (datasets/refusal_probes/<model_key>/attacks_full.jsonl).",
+
+  "out_dir": "./extracts"
+}
