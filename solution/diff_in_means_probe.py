@@ -217,6 +217,7 @@ def sweep_layers(
 ) -> tuple[int, float]:
     """Try each candidate layer index; pick the one with best val AUC.
 
+    Fully streaming — never stacks all vectors into memory at once.
     Returns (best_layer_idx, best_auc).
     """
     from sklearn.metrics import roc_auc_score
@@ -233,9 +234,9 @@ def sweep_layers(
     first_ex = load_extract(extracts_dir, first_sid)
     r = first_ex["residuals"]
     n_layers = r.shape[0] if r.dim() == 3 else 1
+    del first_ex, r
 
     if candidate_layers is None:
-        # Default sweep: every 5 layers across middle range
         if n_layers == 1:
             candidate_layers = [0]
         else:
@@ -247,22 +248,34 @@ def sweep_layers(
     best_layer, best_auc = candidate_layers[0], -1.0
     for li in candidate_layers:
         try:
-            tr_vecs, tr_labels, _ = build_vecs_from_samples(
-                train_samples, label_fn, extracts_dir, layer_idx=li, id_key=id_key)
-            val_vecs, val_labels, _ = build_vecs_from_samples(
-                val_samples, label_fn, extracts_dir, layer_idx=li, id_key=id_key)
+            # streaming r_hat from train subset
+            r_hat, _, _ = compute_dim_streaming(
+                train_samples, label_fn, extracts_dir, li, id_key=id_key)
+            # streaming scores on val subset
+            val_scores, val_labels_list = [], []
+            for s in val_samples:
+                sid = s[id_key]
+                try:
+                    ex = load_extract(extracts_dir, sid)
+                except FileNotFoundError:
+                    continue
+                full = get_layer_tensor(ex, li)
+                mask = ex["attention_mask"]
+                if not isinstance(mask, torch.Tensor):
+                    mask = torch.tensor(mask, dtype=torch.bool)
+                vec = get_last_token(full, mask.bool()).to(torch.float32)
+                del ex, full
+                lbl = label_fn(s)
+                if lbl is None:
+                    continue
+                val_scores.append(float(torch.dot(vec, r_hat).item()))
+                val_labels_list.append(int(lbl))
         except RuntimeError:
             continue
-        pos_mask = tr_labels == 1
-        neg_mask = tr_labels == 0
-        if pos_mask.sum() == 0 or neg_mask.sum() == 0:
+        if len(set(val_labels_list)) < 2:
             continue
-        r_hat = compute_dim_direction(tr_vecs[pos_mask], tr_vecs[neg_mask])
-        scores = torch.mv(val_vecs, r_hat).numpy()
-        y_true = val_labels.numpy().astype(int)
-        if len(set(y_true.tolist())) < 2:
-            continue
-        auc = roc_auc_score(y_true, scores)
+        import numpy as _np
+        auc = roc_auc_score(val_labels_list, val_scores)
         print(f"      layer={li:3d}  val_auc={auc:.4f}")
         if auc > best_auc:
             best_auc = auc
@@ -361,6 +374,7 @@ def train_and_eval_dim(
     r_tensor = first_ex["residuals"]
     n_layers = r_tensor.shape[0] if r_tensor.dim() == 3 else 1
     d_model  = r_tensor.shape[-1]
+    del first_ex, r_tensor  # free large tensor before sweep
     print(f"  n_layers={n_layers}  d_model={d_model}")
 
     # ---- choose layer ----
