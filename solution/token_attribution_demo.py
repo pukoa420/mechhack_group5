@@ -45,9 +45,10 @@ def main():
     ap.add_argument("sample_id")
     ap.add_argument("--task", default="cyber3_prohibited_vs_rest")
     ap.add_argument("--top_n", type=int, default=10)
+    ap.add_argument("--probe_dir", default=str(PROBE_DIR))
     args = ap.parse_args()
 
-    probe_file = PROBE_DIR / f"{args.task}_dim_probe.pt"
+    probe_file = Path(args.probe_dir) / f"{args.task}_dim_probe.pt"
     if not probe_file.exists():
         sys.exit(f"Probe not found: {probe_file}")
 
