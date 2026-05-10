@@ -1,0 +1,30 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: transfer-pod
+  namespace: runai-hackathon-mechhack-sura
+spec:
+  containers:
+  - name: transfer
+    image: ubuntu
+    command: ["/bin/bash", "-c"]
+    args:
+    - |
+      echo "Deleting existing mechhack on g05..."
+      rm -rf /scratch-g05/mechhack
+      echo "Copying all files from g04 to g05..."
+      cp -a /scratch-g04/. /scratch-g05/
+      echo "Done!"
+    volumeMounts:
+    - name: vol-g04
+      mountPath: /scratch-g04
+    - name: vol-g05
+      mountPath: /scratch-g05
+  restartPolicy: Never
+  volumes:
+  - name: vol-g04
+    persistentVolumeClaim:
+      claimName: hackathon-mechhack-scratch-g04
+  - name: vol-g05
+    persistentVolumeClaim:
+      claimName: hackathon-mechhack-scratch-g05

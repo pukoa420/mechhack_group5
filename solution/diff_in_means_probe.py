@@ -109,6 +109,54 @@ def score_vec(vec: torch.Tensor, r_hat: torch.Tensor) -> float:
 # Dataset builders
 # ─────────────────────────────────────────────────────────────────────────────
 
+def compute_dim_streaming(
+    samples: list[dict],
+    label_fn,
+    extracts_dir: Path,
+    layer_idx: Optional[int],
+    id_key: str = "sample_id",
+) -> tuple[torch.Tensor, int, int]:
+    """Compute DIM direction without loading all vectors into memory at once.
+
+    Accumulates running sums for pos/neg classes, frees each .pt file immediately.
+    Returns (r_hat, n_pos, n_neg).
+    """
+    sum_pos = None; count_pos = 0
+    sum_neg = None; count_neg = 0
+    skipped = 0
+    for s in samples:
+        sid = s[id_key]
+        try:
+            ex = load_extract(extracts_dir, sid)
+        except FileNotFoundError:
+            skipped += 1; continue
+        full = get_layer_tensor(ex, layer_idx)
+        mask = ex["attention_mask"]
+        if not isinstance(mask, torch.Tensor):
+            mask = torch.tensor(mask, dtype=torch.bool)
+        vec = get_last_token(full, mask.bool()).to(torch.float32)
+        del ex, full  # free large tensor immediately
+        lbl = label_fn(s)
+        if lbl is None:
+            skipped += 1; continue
+        if lbl == 1.0:
+            sum_pos = vec.clone() if sum_pos is None else sum_pos + vec
+            count_pos += 1
+        else:
+            sum_neg = vec.clone() if sum_neg is None else sum_neg + vec
+            count_neg += 1
+    if skipped:
+        print(f"    [warn] skipped {skipped}/{len(samples)} samples (missing extracts or label)")
+    if count_pos == 0 or count_neg == 0:
+        raise RuntimeError(f"Training set missing one class: pos={count_pos} neg={count_neg}")
+    print(f"  train loaded (streaming): pos={count_pos}  neg={count_neg}")
+    r = (sum_pos / count_pos) - (sum_neg / count_neg)
+    norm = r.norm()
+    if norm < 1e-8:
+        raise RuntimeError("DIM direction has near-zero norm — check labels.")
+    return r / norm, count_pos, count_neg
+
+
 def build_vecs_from_samples(
     samples: list[dict],
     label_fn,
@@ -284,6 +332,17 @@ def train_and_eval_dim(
     """Full train + eval for one task. Returns metrics dict."""
     from sklearn.metrics import roc_auc_score, accuracy_score
 
+    # ---- resume: skip if probe already saved ----
+    out_dir.mkdir(parents=True, exist_ok=True)
+    probe_path = out_dir / f"{task_name}_dim_probe.pt"
+    if probe_path.exists():
+        print(f"\n{'='*60}")
+        print(f"TASK: {task_name}  [SKIPPING — probe already exists at {probe_path}]")
+        ckpt = torch.load(str(probe_path), weights_only=False, map_location="cpu")
+        m = ckpt.get("metrics", {"task": task_name, "test_auc": float("nan"), "train_auc": float("nan")})
+        print(f"  test_auc={m.get('test_auc', float('nan')):.4f}")
+        return m
+
     print(f"\n{'='*60}")
     print(f"TASK: {task_name}")
     print(f"  train={len(train_samples)}  test={len(test_samples)}  extracts={extracts_dir}")
@@ -324,16 +383,9 @@ def train_and_eval_dim(
             extracts_dir, id_key=id_key)
         print(f"  best layer_idx={best_layer}  sweep_val_auc={sweep_auc:.4f}")
 
-    # ---- compute DIM direction on full training set ----
-    tr_vecs, tr_labels, tr_ids = build_vecs_from_samples(
-        train_samples, label_fn, extracts_dir, layer_idx=best_layer, id_key=id_key)
-    pos_mask = tr_labels == 1
-    neg_mask = tr_labels == 0
-    print(f"  train loaded: pos={pos_mask.sum().item()}  neg={neg_mask.sum().item()}")
-    if pos_mask.sum() == 0 or neg_mask.sum() == 0:
-        raise RuntimeError(f"[{task_name}] Training set has only one class — cannot compute DIM direction.")
-
-    r_hat = compute_dim_direction(tr_vecs[pos_mask], tr_vecs[neg_mask])
+    # ---- compute DIM direction on full training set (streaming to avoid OOM) ----
+    r_hat, n_pos, n_neg = compute_dim_streaming(
+        train_samples, label_fn, extracts_dir, best_layer, id_key=id_key)
 
     # ---- evaluate on test set ----
     te_vecs, te_labels, te_ids = build_vecs_from_samples(
@@ -348,18 +400,13 @@ def train_and_eval_dim(
         preds = (te_scores > 0.0).astype(int)
         acc   = float(accuracy_score(y_true, preds))
 
-    # Compute train AUC (sanity check)
-    tr_scores = torch.mv(tr_vecs, r_hat).numpy()
-    tr_auc = float("nan")
-    y_tr = tr_labels.numpy().astype(int)
-    if len(set(y_tr.tolist())) > 1:
-        tr_auc = float(roc_auc_score(y_tr, tr_scores))
+    tr_auc = float("nan")  # skipped — streaming train load doesn't retain all vecs
 
     metrics = {
         "task": task_name,
         "layer_idx": best_layer,
-        "n_train_pos": int(pos_mask.sum().item()),
-        "n_train_neg": int(neg_mask.sum().item()),
+        "n_train_pos": n_pos,
+        "n_train_neg": n_neg,
         "n_test": int(len(te_ids)),
         "test_auc": auc,
         "test_acc": acc,
@@ -370,17 +417,10 @@ def train_and_eval_dim(
     print(f"  test_auc={auc:.4f}  test_acc={acc:.4f}  train_auc={tr_auc:.4f}")
 
     # ---- save probe + per-sample scores ----
-    out_dir.mkdir(parents=True, exist_ok=True)
-    probe_path = out_dir / f"{task_name}_dim_probe.pt"
-
-    # Build per-sample score records for both splits (useful for Level 2)
-    tr_records = [{"sample_id": sid, "split": "train", "score": float(s), "label": int(l),
-                   "prob": float(1.0 / (1.0 + math.exp(-float(s))))}
-                  for sid, s, l in zip(tr_ids, tr_scores, y_tr)]
+    # (train records omitted — streaming load doesn't retain per-sample scores)
     te_records = [{"sample_id": sid, "split": "test",  "score": float(s), "label": int(l),
                    "prob": float(1.0 / (1.0 + math.exp(-float(s))))}
                   for sid, s, l in zip(te_ids, te_scores, y_true)]
-    all_records = tr_records + te_records
 
     torch.save({
         "r_hat":      r_hat.cpu(),
@@ -389,9 +429,9 @@ def train_and_eval_dim(
         "metrics":    metrics,
         "d_model":    d_model,
         "n_layers":   n_layers,
-        "rows_train": tr_records,
+        "rows_train": [],
         "rows_test":  te_records,
-        "rows_all":   all_records,
+        "rows_all":   te_records,
     }, str(probe_path))
     print(f"  saved → {probe_path}")
 
